@@ -340,3 +340,4 @@ ASALocalRun/
 healthchecksdb
 /YTLWebApplication/KPIFinal.zip
 /YTLWebApplication/dashboard/app-assets/images/portrait/small
+.env
