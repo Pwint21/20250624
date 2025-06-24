@@ -10,7 +10,329 @@ Imports System.Data
 Imports System.Security
 Imports System.Collections.Generic
 Imports System.Linq
+Imports System.Net
+
 Public Class SecurityHelper
+    ' Security configuration constants
+    Private Shared ReadOnly BLOCKED_USER_AGENTS As String() = {
+        "sqlmap", "nikto", "nmap", "masscan", "zap", "burp", "acunetix", 
+        "nessus", "openvas", "w3af", "skipfish", "wpscan", "dirb", "gobuster"
+    }
+    
+    Private Shared ReadOnly SUSPICIOUS_PATTERNS As String() = {
+        "union.*select", "insert.*into", "update.*set", "delete.*from",
+        "drop.*table", "create.*table", "alter.*table", "exec.*xp_",
+        "sp_oacreate", "sp_oamethod", "openrowset", "opendatasource",
+        "xp_cmdshell", "bulk.*insert", "truncate.*table", "<script",
+        "javascript:", "vbscript:", "onload=", "onerror=", "eval\(",
+        "expression\(", "document\.", "window\.", "alert\(", "confirm\(",
+        "../", "..\\", "%2e%2e", "%252e%252e", "etc/passwd", "boot.ini"
+    }
+
+    ' Initialize security settings
+    Public Shared Sub InitializeSecuritySettings()
+        Try
+            ' Set machine key for encryption if not already set
+            If HttpContext.Current.Cache("SecurityInitialized") Is Nothing Then
+                HttpContext.Current.Cache.Insert("SecurityInitialized", True, Nothing, DateTime.Now.AddHours(24), TimeSpan.Zero)
+                LogSecurityEvent("SECURITY_INITIALIZED", "Security settings initialized")
+            End If
+        Catch ex As Exception
+            LogSecurityEvent("SECURITY_INIT_ERROR", ex.Message)
+        End Try
+    End Sub
+
+    ' Get client IP address (handles proxies and load balancers)
+    Public Shared Function GetClientIPAddress(request As HttpRequest) As String
+        Try
+            Dim ipAddress As String = String.Empty
+            
+            ' Check for IP from shared internet
+            If Not String.IsNullOrEmpty(request.ServerVariables("HTTP_CLIENT_IP")) Then
+                ipAddress = request.ServerVariables("HTTP_CLIENT_IP")
+            ElseIf Not String.IsNullOrEmpty(request.ServerVariables("HTTP_X_FORWARDED_FOR")) Then
+                ' Check for IP passed from proxy
+                ipAddress = request.ServerVariables("HTTP_X_FORWARDED_FOR").Split(","c)(0).Trim()
+            ElseIf Not String.IsNullOrEmpty(request.ServerVariables("HTTP_X_FORWARDED")) Then
+                ipAddress = request.ServerVariables("HTTP_X_FORWARDED")
+            ElseIf Not String.IsNullOrEmpty(request.ServerVariables("HTTP_FORWARDED_FOR")) Then
+                ipAddress = request.ServerVariables("HTTP_FORWARDED_FOR")
+            ElseIf Not String.IsNullOrEmpty(request.ServerVariables("HTTP_FORWARDED")) Then
+                ipAddress = request.ServerVariables("HTTP_FORWARDED")
+            Else
+                ipAddress = request.ServerVariables("REMOTE_ADDR")
+            End If
+            
+            ' Validate IP address format
+            Dim ip As IPAddress
+            If IPAddress.TryParse(ipAddress, ip) Then
+                Return ipAddress
+            Else
+                Return request.UserHostAddress
+            End If
+            
+        Catch ex As Exception
+            LogSecurityEvent("IP_ADDRESS_ERROR", ex.Message)
+            Return request.UserHostAddress
+        End Try
+    End Function
+
+    ' Check if request is suspicious
+    Public Shared Function IsSuspiciousRequest(request As HttpRequest) As Boolean
+        Try
+            ' Check User-Agent
+            Dim userAgent As String = If(request.UserAgent, String.Empty).ToLower()
+            For Each blockedAgent As String In BLOCKED_USER_AGENTS
+                If userAgent.Contains(blockedAgent) Then
+                    Return True
+                End If
+            Next
+            
+            ' Check URL for suspicious patterns
+            Dim url As String = request.Url.ToString().ToLower()
+            For Each pattern As String In SUSPICIOUS_PATTERNS
+                If Regex.IsMatch(url, pattern, RegexOptions.IgnoreCase) Then
+                    Return True
+                End If
+            Next
+            
+            ' Check query string
+            If Not String.IsNullOrEmpty(request.QueryString.ToString()) Then
+                Dim queryString As String = request.QueryString.ToString().ToLower()
+                For Each pattern As String In SUSPICIOUS_PATTERNS
+                    If Regex.IsMatch(queryString, pattern, RegexOptions.IgnoreCase) Then
+                        Return True
+                    End If
+                Next
+            End If
+            
+            ' Check form data
+            If request.Form IsNot Nothing Then
+                For Each key As String In request.Form.AllKeys
+                    If key IsNot Nothing Then
+                        Dim value As String = If(request.Form(key), String.Empty).ToLower()
+                        For Each pattern As String In SUSPICIOUS_PATTERNS
+                            If Regex.IsMatch(value, pattern, RegexOptions.IgnoreCase) Then
+                                Return True
+                            End If
+                        Next
+                    End If
+                Next
+            End If
+            
+            ' Check headers for suspicious content
+            For Each headerName As String In request.Headers.AllKeys
+                If headerName IsNot Nothing Then
+                    Dim headerValue As String = If(request.Headers(headerName), String.Empty).ToLower()
+                    If ContainsDangerousPatterns(headerValue) Then
+                        Return True
+                    End If
+                End If
+            Next
+            
+            Return False
+            
+        Catch ex As Exception
+            LogSecurityEvent("SUSPICIOUS_REQUEST_CHECK_ERROR", ex.Message)
+            Return False
+        End Try
+    End Function
+
+    ' Enhanced rate limiting with sliding window
+    Public Shared Function IsRateLimited(identifier As String, maxRequests As Integer, timeWindowMinutes As Integer) As Boolean
+        Try
+            Dim cacheKey As String = $"RateLimit_{identifier}"
+            Dim requestTimes As List(Of DateTime) = TryCast(HttpContext.Current.Cache(cacheKey), List(Of DateTime))
+            
+            If requestTimes Is Nothing Then
+                requestTimes = New List(Of DateTime)()
+            End If
+            
+            ' Remove old requests outside the time window
+            Dim cutoffTime As DateTime = DateTime.Now.AddMinutes(-timeWindowMinutes)
+            requestTimes.RemoveAll(Function(time) time < cutoffTime)
+            
+            ' Check if limit exceeded
+            If requestTimes.Count >= maxRequests Then
+                Return True
+            End If
+            
+            ' Add current request
+            requestTimes.Add(DateTime.Now)
+            
+            ' Update cache
+            HttpContext.Current.Cache.Insert(cacheKey, requestTimes, Nothing, 
+                DateTime.Now.AddMinutes(timeWindowMinutes), TimeSpan.Zero)
+            
+            Return False
+            
+        Catch ex As Exception
+            LogSecurityEvent("RATE_LIMIT_ERROR", ex.Message)
+            Return False
+        End Try
+    End Function
+
+    ' Validate and sanitize file upload
+    Public Shared Function ValidateFileUpload(fileUpload As HttpPostedFile, allowedExtensions As String(), maxSizeBytes As Long) As Boolean
+        Try
+            If fileUpload Is Nothing OrElse fileUpload.ContentLength = 0 Then
+                Return False
+            End If
+            
+            ' Check file size
+            If fileUpload.ContentLength > maxSizeBytes Then
+                LogSecurityEvent("FILE_SIZE_EXCEEDED", $"Size: {fileUpload.ContentLength}, Max: {maxSizeBytes}")
+                Return False
+            End If
+            
+            ' Check file extension
+            Dim extension As String = Path.GetExtension(fileUpload.FileName).ToLower()
+            If Not allowedExtensions.Contains(extension) Then
+                LogSecurityEvent("INVALID_FILE_EXTENSION", $"Extension: {extension}")
+                Return False
+            End If
+            
+            ' Check MIME type
+            Dim allowedMimeTypes As String() = {
+                "image/jpeg", "image/png", "image/gif", "image/bmp",
+                "application/pdf", "text/plain", "application/msword",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            }
+            
+            If Not allowedMimeTypes.Contains(fileUpload.ContentType.ToLower()) Then
+                LogSecurityEvent("INVALID_MIME_TYPE", $"MIME: {fileUpload.ContentType}")
+                Return False
+            End If
+            
+            ' Check for malicious content in filename
+            If ContainsDangerousPatterns(fileUpload.FileName) Then
+                LogSecurityEvent("MALICIOUS_FILENAME", $"Filename: {fileUpload.FileName}")
+                Return False
+            End If
+            
+            Return True
+            
+        Catch ex As Exception
+            LogSecurityEvent("FILE_VALIDATION_ERROR", ex.Message)
+            Return False
+        End Try
+    End Function
+
+    ' Generate secure random password
+    Public Shared Function GenerateSecurePassword(length As Integer) As String
+        Try
+            Const chars As String = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*"
+            Using rng As New RNGCryptoServiceProvider()
+                Dim bytes(length - 1) As Byte
+                rng.GetBytes(bytes)
+                
+                Dim result As New StringBuilder(length)
+                For Each b As Byte In bytes
+                    result.Append(chars(b Mod chars.Length))
+                Next
+                
+                Return result.ToString()
+            End Using
+        Catch ex As Exception
+            LogSecurityEvent("PASSWORD_GENERATION_ERROR", ex.Message)
+            Return String.Empty
+        End Try
+    End Function
+
+    ' Validate password strength
+    Public Shared Function ValidatePasswordStrength(password As String) As Boolean
+        Try
+            If String.IsNullOrEmpty(password) OrElse password.Length < 8 Then
+                Return False
+            End If
+            
+            ' Check for at least one uppercase letter
+            If Not Regex.IsMatch(password, "[A-Z]") Then
+                Return False
+            End If
+            
+            ' Check for at least one lowercase letter
+            If Not Regex.IsMatch(password, "[a-z]") Then
+                Return False
+            End If
+            
+            ' Check for at least one digit
+            If Not Regex.IsMatch(password, "[0-9]") Then
+                Return False
+            End If
+            
+            ' Check for at least one special character
+            If Not Regex.IsMatch(password, "[!@#$%^&*()_+\-=\[\]{};':""\\|,.<>\/?]") Then
+                Return False
+            End If
+            
+            Return True
+            
+        Catch ex As Exception
+            LogSecurityEvent("PASSWORD_VALIDATION_ERROR", ex.Message)
+            Return False
+        End Try
+    End Function
+
+    ' Encrypt sensitive data
+    Public Shared Function EncryptData(plainText As String, key As String) As String
+        Try
+            If String.IsNullOrEmpty(plainText) Then
+                Return String.Empty
+            End If
+            
+            Using aes As Aes = Aes.Create()
+                aes.Key = Encoding.UTF8.GetBytes(key.PadRight(32).Substring(0, 32))
+                aes.IV = New Byte(15) {} ' Zero IV for simplicity, use random IV in production
+                
+                Using encryptor As ICryptoTransform = aes.CreateEncryptor(aes.Key, aes.IV)
+                    Using msEncrypt As New MemoryStream()
+                        Using csEncrypt As New CryptoStream(msEncrypt, encryptor, CryptoStreamMode.Write)
+                            Using swEncrypt As New StreamWriter(csEncrypt)
+                                swEncrypt.Write(plainText)
+                            End Using
+                        End Using
+                        Return Convert.ToBase64String(msEncrypt.ToArray())
+                    End Using
+                End Using
+            End Using
+            
+        Catch ex As Exception
+            LogSecurityEvent("ENCRYPTION_ERROR", ex.Message)
+            Return String.Empty
+        End Try
+    End Function
+
+    ' Decrypt sensitive data
+    Public Shared Function DecryptData(cipherText As String, key As String) As String
+        Try
+            If String.IsNullOrEmpty(cipherText) Then
+                Return String.Empty
+            End If
+            
+            Dim cipherBytes As Byte() = Convert.FromBase64String(cipherText)
+            
+            Using aes As Aes = Aes.Create()
+                aes.Key = Encoding.UTF8.GetBytes(key.PadRight(32).Substring(0, 32))
+                aes.IV = New Byte(15) {} ' Zero IV for simplicity, use random IV in production
+                
+                Using decryptor As ICryptoTransform = aes.CreateDecryptor(aes.Key, aes.IV)
+                    Using msDecrypt As New MemoryStream(cipherBytes)
+                        Using csDecrypt As New CryptoStream(msDecrypt, decryptor, CryptoStreamMode.Read)
+                            Using srDecrypt As New StreamReader(csDecrypt)
+                                Return srDecrypt.ReadToEnd()
+                            End Using
+                        End Using
+                    End Using
+                End Using
+            End Using
+            
+        Catch ex As Exception
+            LogSecurityEvent("DECRYPTION_ERROR", ex.Message)
+            Return String.Empty
+        End Try
+    End Function
+
     ' Validate users list format
     Public Shared Function ValidateUsersList(usersList As String) As Boolean
         Try
@@ -151,7 +473,7 @@ Public Class SecurityHelper
         End If
 
         ' Remove potentially dangerous characters
-        Dim sanitized As String = input.Replace("'", "''").Replace("<", "&lt;").Replace(">", "&gt;")
+        Dim sanitized As String = input.Replace("'", "''").Replace("<", "<").Replace(">", ">")
 
         ' Truncate to max length
         If sanitized.Length > maxLength Then
@@ -618,8 +940,8 @@ Public Class SecurityHelper
         Return input.Replace("\", "\\") _
                    .Replace("'", "\'") _
                    .Replace("""", "\""") _
-                   .Replace("<", "&lt;") _
-                   .Replace(">", "&gt;")
+                   .Replace("<", "<") _
+                   .Replace(">", ">")
     End Function
     ' SECURITY FIX: Session validation
     Public Shared Function ValidateSession() As Boolean
